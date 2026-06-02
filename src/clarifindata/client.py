@@ -23,7 +23,7 @@ from typing import Any
 
 import httpx
 
-DEFAULT_BASE_URL = "https://clarifindata.com/api"
+DEFAULT_BASE_URL = "https://api.clarifindata.com"
 
 
 class Client:
