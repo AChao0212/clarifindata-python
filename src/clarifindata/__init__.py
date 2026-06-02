@@ -1,0 +1,6 @@
+"""clarifindata — Python SDK for the clarifindata data API."""
+
+from .client import Client
+
+__version__ = "0.1.0"
+__all__ = ["Client", "__version__"]
