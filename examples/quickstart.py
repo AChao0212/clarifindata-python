@@ -1,20 +1,14 @@
-"""Minimal quickstart for the clarifindata Python client.
+"""clarifindata quickstart — pip install 'clarifindata[pandas]'"""
+from clarifindata import Client, datasets
 
-Run:
-    pip install clarifindata
-    python examples/quickstart.py
-"""
-from clarifindata import Client
+cfd = Client(api_key="cfd_demo_free_0001")          # free demo key
 
+# typed dataset names + DataFrame output
+df = cfd.get(datasets.TaiwanStockPER, stock_id="2330",
+             start="2026-06-02", end="2026-06-03", as_df=True)
+print(df)
+print("rate limit remaining:", cfd.rate_limit_remaining)
 
-def main() -> None:
-    # Demo lite key — replace with your own from https://clarifindata.com
-    with Client(api_key="cfd_demo_lite_0002") as cfd:
-        rows = cfd.taiwan_stock_price(stock_id="2330", limit=5)
-        print(f"latest {len(rows)} closes for 2330:")
-        for r in rows:
-            print(f"  {r['trade_date']}  close={r['close']}")
-
-
-if __name__ == "__main__":
-    main()
+# full history, auto-paginated around the 10k-row cap
+for batch in cfd.iter_history(datasets.TaiwanStockPER, stock_id="2330", since="2025-01-01"):
+    print("batch:", len(batch))

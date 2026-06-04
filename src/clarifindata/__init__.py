@@ -1,6 +1,28 @@
-"""clarifindata — Python SDK for the clarifindata data API."""
+"""clarifindata — Python client for the 金晰數據 Taiwan-stock data API.
 
-from .client import Client
+    from clarifindata import Client, datasets
+    cfd = Client(api_key="cfd_demo_free_0001")
+    df = cfd.get(datasets.TaiwanStockPrice, stock_id="2330",
+                 start="2026-04-01", as_df=True)
 
-__version__ = "0.1.0"
-__all__ = ["Client", "__version__"]
+Concurrency (quant default):
+
+    import asyncio
+    from clarifindata import AsyncClient, datasets
+    async def main():
+        async with AsyncClient(api_key="...") as cfd:
+            out = await asyncio.gather(*[
+                cfd.get(datasets.TaiwanStockPrice, stock_id=s) for s in ("2330", "2317")])
+"""
+from __future__ import annotations
+
+from . import datasets
+from .client import AsyncClient, Client, __version__
+from .errors import (AuthError, ClarifindataError, NotFoundError, RateLimitError,
+                     TierError, ValidationError)
+
+__all__ = [
+    "Client", "AsyncClient", "datasets", "__version__",
+    "ClarifindataError", "AuthError", "TierError", "RateLimitError",
+    "NotFoundError", "ValidationError",
+]
