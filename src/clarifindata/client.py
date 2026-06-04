@@ -96,7 +96,7 @@ def _validate_dataset(dataset: str) -> None:
                               suggestion="Use clarifindata.datasets.* for valid names.")
 
 
-def _params(stock_id, start, end, limit) -> dict[str, Any]:
+def _params(stock_id, start, end, limit, cursor=None) -> dict[str, Any]:
     p: dict[str, Any] = {"limit": limit}
     if stock_id is not None:
         p["stock_id"] = stock_id
@@ -104,6 +104,8 @@ def _params(stock_id, start, end, limit) -> dict[str, Any]:
         p["start"] = str(start)
     if end is not None:
         p["end"] = str(end)
+    if cursor is not None:
+        p["cursor"] = cursor
     return p
 
 
@@ -263,10 +265,26 @@ class Client:
         body = self._request("GET", f"/v1/data/{dataset}",
                              params=_params(stock_id, start, end, limit), dataset=dataset)
         rows = body.get("data", [])
-        if len(rows) == limit:
+        if len(rows) == limit and body.get("next_cursor") is None:
             log.warning("'%s' returned exactly limit=%d rows — result is likely TRUNCATED. "
                         "Raise limit or use iter_history().", dataset, limit)
         return _to_df(rows) if as_df else rows
+
+    def _pull_window(self, dataset: str, *, stock_id=None, start=None, end=None) -> list:
+        """Fully drain one (stock_id, start, end) window by following the server's
+        keyset `next_cursor` until it is null. Returns all rows as one list[dict].
+        This is what lets unbounded datasets (e.g. WarrantInfo, ~126k rows) be
+        collected despite the per-request ROW_CAP."""
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            body = self._request("GET", f"/v1/data/{dataset}",
+                                 params=_params(stock_id, start, end, ROW_CAP, cursor),
+                                 dataset=dataset)
+            out.extend(body.get("data", []))
+            cursor = body.get("next_cursor")
+            if not cursor:
+                return out
 
     def iter_history(self, dataset: str, *, stock_id: str | None = None,
                      since: date | str | None = None, until: date | str | None = None,
@@ -278,14 +296,16 @@ class Client:
         skips date chunking and yields a single batch capped at ROW_CAP."""
         _validate_dataset(dataset)
         if since is None:
-            rows = self.get(dataset, stock_id=stock_id, limit=ROW_CAP)
+            # No date axis: drain the whole dataset via keyset cursor (handles
+            # datasets larger than ROW_CAP, e.g. WarrantInfo).
+            rows = self._pull_window(dataset, stock_id=stock_id)
             if rows:
                 yield _to_df(rows) if as_df else rows
             return
         s = _as_date(since)
         u = _as_date(until) if until else date.today()
         for cs, ce in _month_chunks(s, u):
-            rows = self.get(dataset, stock_id=stock_id, start=cs, end=ce, limit=ROW_CAP)
+            rows = self._pull_window(dataset, stock_id=stock_id, start=cs, end=ce)
             if rows:
                 yield _to_df(rows) if as_df else rows
 
@@ -310,7 +330,8 @@ class Client:
             if self.rate_limit_remaining is not None and self.rate_limit_remaining < 5:
                 log.warning("rate limit nearly exhausted — pausing 5s")
                 time.sleep(5)
-            out[d] = self.get(d, stock_id=stock_id, start=start, end=end, limit=ROW_CAP, as_df=as_df)
+            rows = self._pull_window(d, stock_id=stock_id, start=start, end=end)
+            out[d] = _to_df(rows) if as_df else rows
         return out
 
     def ask(self, question: str, *, as_df: bool = False):
@@ -400,9 +421,23 @@ class AsyncClient:
         body = await self._request("GET", f"/v1/data/{dataset}",
                                    params=_params(stock_id, start, end, limit), dataset=dataset)
         rows = body.get("data", [])
-        if len(rows) == limit:
+        if len(rows) == limit and body.get("next_cursor") is None:
             log.warning("'%s' returned exactly limit=%d — likely truncated.", dataset, limit)
         return _to_df(rows) if as_df else rows
+
+    async def _pull_window(self, dataset: str, *, stock_id=None, start=None, end=None) -> list:
+        """Async mirror of Client._pull_window — drains one window by following
+        `next_cursor` until null."""
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            body = await self._request("GET", f"/v1/data/{dataset}",
+                                       params=_params(stock_id, start, end, ROW_CAP, cursor),
+                                       dataset=dataset)
+            out.extend(body.get("data", []))
+            cursor = body.get("next_cursor")
+            if not cursor:
+                return out
 
     async def iter_history(self, dataset: str, *, stock_id=None,
                            since: date | str | None = None, until: date | str | None = None,
@@ -414,14 +449,14 @@ class AsyncClient:
         _validate_dataset(dataset)
         batches: list = []
         if since is None:
-            rows = await self.get(dataset, stock_id=stock_id, limit=ROW_CAP)
+            rows = await self._pull_window(dataset, stock_id=stock_id)
             if rows:
                 batches.append(_to_df(rows) if as_df else rows)
             return batches
         s = _as_date(since)
         u = _as_date(until) if until else date.today()
         for cs, ce in _month_chunks(s, u):
-            rows = await self.get(dataset, stock_id=stock_id, start=cs, end=ce, limit=ROW_CAP)
+            rows = await self._pull_window(dataset, stock_id=stock_id, start=cs, end=ce)
             if rows:
                 batches.append(_to_df(rows) if as_df else rows)
         return batches
@@ -442,11 +477,12 @@ class AsyncClient:
         """Fetch several datasets for the same window concurrently.
         Returns {dataset: rows|DataFrame}."""
         import asyncio
-        results = await asyncio.gather(*[
-            self.get(d, stock_id=stock_id, start=start, end=end, limit=ROW_CAP, as_df=as_df)
+        rows_per = await asyncio.gather(*[
+            self._pull_window(d, stock_id=stock_id, start=start, end=end)
             for d in datasets
         ])
-        return dict(zip(datasets, results))
+        return {d: (_to_df(rows) if as_df else rows)
+                for d, rows in zip(datasets, rows_per)}
 
     async def ask(self, question: str, *, as_df: bool = False):
         body = await self._request("POST", "/v1/ask", json_body={"question": question})
