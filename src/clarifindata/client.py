@@ -269,11 +269,19 @@ class Client:
         return _to_df(rows) if as_df else rows
 
     def iter_history(self, dataset: str, *, stock_id: str | None = None,
-                     since: date | str, until: date | str | None = None,
+                     since: date | str | None = None, until: date | str | None = None,
                      as_df: bool = False) -> Iterator:
         """Stream a full date range in year-sized chunks (auto-paginates around
-        the 10000-row cap). Yields one batch (list[dict] or DataFrame) per chunk."""
+        the 10000-row cap). Yields one batch (list[dict] or DataFrame) per chunk.
+
+        When `since` is None (e.g. reference/realtime datasets with no date axis),
+        skips date chunking and yields a single batch capped at ROW_CAP."""
         _validate_dataset(dataset)
+        if since is None:
+            rows = self.get(dataset, stock_id=stock_id, limit=ROW_CAP)
+            if rows:
+                yield _to_df(rows) if as_df else rows
+            return
         s = _as_date(since)
         u = _as_date(until) if until else date.today()
         for cs, ce in _month_chunks(s, u):
@@ -282,7 +290,10 @@ class Client:
                 yield _to_df(rows) if as_df else rows
 
     def history(self, dataset: str, **kw) -> list[dict[str, Any]]:
-        """Convenience: fully materialise iter_history into one list (or DataFrame)."""
+        """Convenience: fully materialise iter_history into one list (or DataFrame).
+
+        `since` is optional: omit it for datasets with no date axis (reference/
+        realtime) and it behaves like get(dataset, limit=ROW_CAP)."""
         as_df = kw.pop("as_df", False)
         out: list[dict[str, Any]] = []
         for batch in self.iter_history(dataset, **kw):
@@ -392,6 +403,50 @@ class AsyncClient:
         if len(rows) == limit:
             log.warning("'%s' returned exactly limit=%d — likely truncated.", dataset, limit)
         return _to_df(rows) if as_df else rows
+
+    async def iter_history(self, dataset: str, *, stock_id=None,
+                           since: date | str | None = None, until: date | str | None = None,
+                           as_df: bool = False) -> list:
+        """Async mirror of Client.iter_history. Returns the list of per-chunk
+        batches (each a list[dict] or DataFrame); iterate with a plain `for`.
+
+        When `since` is None, returns a single batch capped at ROW_CAP."""
+        _validate_dataset(dataset)
+        batches: list = []
+        if since is None:
+            rows = await self.get(dataset, stock_id=stock_id, limit=ROW_CAP)
+            if rows:
+                batches.append(_to_df(rows) if as_df else rows)
+            return batches
+        s = _as_date(since)
+        u = _as_date(until) if until else date.today()
+        for cs, ce in _month_chunks(s, u):
+            rows = await self.get(dataset, stock_id=stock_id, start=cs, end=ce, limit=ROW_CAP)
+            if rows:
+                batches.append(_to_df(rows) if as_df else rows)
+        return batches
+
+    async def history(self, dataset: str, **kw) -> list[dict[str, Any]]:
+        """Convenience: fully materialise iter_history into one list (or DataFrame).
+
+        `since` is optional: omit it for datasets with no date axis."""
+        as_df = kw.pop("as_df", False)
+        out: list[dict[str, Any]] = []
+        for batch in await self.iter_history(dataset, **kw):
+            out.extend(batch)
+        return _to_df(out) if as_df else out
+
+    async def bulk_pull(self, datasets: list[str], *, start: date | str | None = None,
+                        end: date | str | None = None, stock_id: str | None = None,
+                        as_df: bool = False) -> dict[str, Any]:
+        """Fetch several datasets for the same window concurrently.
+        Returns {dataset: rows|DataFrame}."""
+        import asyncio
+        results = await asyncio.gather(*[
+            self.get(d, stock_id=stock_id, start=start, end=end, limit=ROW_CAP, as_df=as_df)
+            for d in datasets
+        ])
+        return dict(zip(datasets, results))
 
     async def ask(self, question: str, *, as_df: bool = False):
         body = await self._request("POST", "/v1/ask", json_body={"question": question})

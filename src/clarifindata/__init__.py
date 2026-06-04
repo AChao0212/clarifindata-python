@@ -18,11 +18,13 @@ from __future__ import annotations
 
 from . import datasets
 from .client import AsyncClient, Client, __version__
+from .datasets import DATASET_ROW_TYPES, DatasetRow, Row
 from .errors import (AuthError, ClarifindataError, NotFoundError, RateLimitError,
                      TierError, ValidationError)
 
 __all__ = [
     "Client", "AsyncClient", "datasets", "__version__",
+    "DatasetRow", "Row", "DATASET_ROW_TYPES",
     "ClarifindataError", "AuthError", "TierError", "RateLimitError",
     "NotFoundError", "ValidationError",
 ]
