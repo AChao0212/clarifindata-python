@@ -15,8 +15,8 @@ import json
 import logging
 import os
 import time
-from datetime import date, datetime, timedelta
-from typing import Any, Iterator, AsyncIterator
+from datetime import date, datetime
+from typing import Any, Iterator
 
 import httpx
 

@@ -17,6 +17,9 @@ dependencies = ["httpx>=0.24"]
 pandas = ["pandas>=1.5"]
 http2  = ["h2>=4.0"]
 all    = ["pandas>=1.5", "h2>=4.0"]
+# Tooling for CI / local dev. `ruff check .` in ci.yml needs this installed;
+# pandas is included so the import smoke-test exercises the optional as_df path.
+dev    = ["ruff>=0.5", "pandas>=1.5"]
 
 [project.urls]
 Homepage = "https://clarifindata.com"
