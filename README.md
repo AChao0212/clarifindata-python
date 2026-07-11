@@ -1,6 +1,6 @@
 # clarifindata — Python client
 
-Python client for the **金晰數據 / clarifindata** Taiwan-stock data API (81 datasets:
+Python client for the **金晰數據 / clarifindata** Taiwan-stock data API (82 datasets:
 prices, chips, fundamentals, derivatives, macro — full history, refreshed daily).
 
 ```bash
