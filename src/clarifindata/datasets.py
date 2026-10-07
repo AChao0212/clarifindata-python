@@ -101,6 +101,7 @@ DATASET_TIERS: dict[str, str] = {
     'TaiwanStockDisposition': 'lite',
     'TaiwanStockDividend': 'free',
     'TaiwanStockDividendResult': 'free',
+    'TaiwanStockDividendSchedule': 'free',
     'TaiwanStockFinancialStatement': 'free',
     'TaiwanStockHoldingSharesPer': 'lite',
     'TaiwanStockInstitutionalInvestorsBuySell': 'lite',
