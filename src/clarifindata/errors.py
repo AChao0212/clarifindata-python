@@ -25,11 +25,7 @@ class ClarifindataError(Exception):
 
 
 class AuthError(ClarifindataError):
-    """401/403 — bad/missing key, or the dataset needs a higher tier."""
-
-
-class TierError(AuthError):
-    """403 — your tier can't access this dataset/endpoint."""
+    """401/403: missing or invalid credentials, or access denied by the server."""
 
 
 class RateLimitError(ClarifindataError):

@@ -1,7 +1,7 @@
 """clarifindata — Python client for the 金晰數據 Taiwan-stock data API.
 
     from clarifindata import Client, datasets
-    cfd = Client(api_key="cfd_demo_free_0001")
+    cfd = Client(api_key="your_api_key")
     df = cfd.get(datasets.TaiwanStockPrice, stock_id="2330",
                  start="2026-04-01", as_df=True)
 
@@ -20,11 +20,11 @@ from . import datasets
 from .client import AsyncClient, Client, __version__
 from .datasets import DATASET_ROW_TYPES, DatasetRow, Row
 from .errors import (AuthError, ClarifindataError, NotFoundError, RateLimitError,
-                     TierError, ValidationError)
+                     ValidationError)
 
 __all__ = [
     "Client", "AsyncClient", "datasets", "__version__",
     "DatasetRow", "Row", "DATASET_ROW_TYPES",
-    "ClarifindataError", "AuthError", "TierError", "RateLimitError",
+    "ClarifindataError", "AuthError", "RateLimitError",
     "NotFoundError", "ValidationError",
 ]

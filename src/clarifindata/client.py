@@ -1,7 +1,7 @@
 """clarifindata Python client — sync (`Client`) and async (`AsyncClient`).
 
     from clarifindata import Client, datasets
-    cfd = Client(api_key="cfd_demo_free_0001")
+    cfd = Client(api_key="your_api_key")
     df = cfd.get(datasets.TaiwanStockPrice, stock_id="2330", start="2026-04-01", as_df=True)
 
 Features: automatic retry (429/5xx, honours Retry-After), rate-limit awareness,
@@ -22,7 +22,7 @@ import httpx
 
 from . import datasets as _ds
 from .errors import (AuthError, ClarifindataError, NotFoundError, RateLimitError,
-                     TierError, ValidationError)
+                     ValidationError)
 
 try:
     from importlib.metadata import version as _pkg_version
@@ -52,14 +52,13 @@ def _suggest(status: int, dataset: str | None) -> str:
     if status in (401,):
         return "Check your api_key (Authorization: Bearer <key>)."
     if status == 403:
-        tier = _ds.DATASET_TIERS.get(dataset or "", "?")
-        return f"This needs a higher tier (dataset '{dataset}' requires '{tier}'). Upgrade or use a free dataset."
+        return "Access denied; check the server detail and your account credentials."
     if status == 404:
         return "Unknown dataset/endpoint — see clarifindata.datasets.ALL or cfd.catalog()."
     if status in (400, 422):
         return "Bad params — check the dataset name (clarifindata.datasets.*), date format (YYYY-MM-DD), and limit ≤ 10000."
     if status == 429:
-        return "Rate limit — the client retries automatically; lower concurrency or upgrade tier."
+        return "Rate limit — the client retries automatically; lower concurrency or wait for the quota window."
     return "See https://clarifindata.com/docs"
 
 
@@ -72,7 +71,7 @@ def _err_from_response(r: httpx.Response, dataset: str | None) -> ClarifindataEr
               suggestion=_suggest(r.status_code, dataset))
     s = r.status_code
     if s == 403:
-        return TierError("Forbidden", **kw)
+        return AuthError("Forbidden", **kw)
     if s == 401:
         return AuthError("Unauthorized", **kw)
     if s == 404:
@@ -109,13 +108,33 @@ def _params(stock_id, start, end, limit, cursor=None) -> dict[str, Any]:
     return p
 
 
-def _to_df(rows: list[dict[str, Any]]):
+def _to_df(rows: list[dict[str, Any]], attribution: list[dict[str, Any]]):
     try:
         import pandas as pd
     except ImportError as e:
         raise ClarifindataError(
             "pandas not installed", suggestion="pip install 'clarifindata[pandas]'") from e
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    frame.attrs["attribution"] = attribution
+    return frame
+
+
+def _merge_attribution(target: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> None:
+    """Keep the first statement for each source, in response order."""
+    seen = {entry["source_id"] for entry in target}
+    for entry in incoming:
+        if entry["source_id"] not in seen:
+            target.append(entry)
+            seen.add(entry["source_id"])
+
+
+def _result(body: dict[str, Any], as_df: bool, with_meta: bool):
+    """Preserve metadata on request, and attribution on every DataFrame."""
+    attribution = body.get("attribution", [])
+    data = _to_df(body.get("data", []), attribution) if as_df else body.get("data", [])
+    if with_meta:
+        return {**body, "data": data, "attribution": attribution}
+    return data
 
 
 def _cache_path(cache_dir: str, method: str, url: str, params: dict) -> str:
@@ -156,7 +175,6 @@ class Client:
         self.warn_rate_limit_pct = warn_rate_limit_pct
         self.rate_limit_limit: int | None = None
         self.rate_limit_remaining: int | None = None
-        self.tier: str | None = None
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
         try:
@@ -190,11 +208,11 @@ class Client:
     def __repr__(self) -> str:
         rem = self.rate_limit_remaining
         return (f"Client(base_url={self.base_url!r}, key={_mask(self.api_key)}, "
-                f"tier={self.tier}, rate_limit_remaining={rem})")
+                f"rate_limit_remaining={rem})")
 
     # core request with retry + rate-limit tracking + cache
     def _request(self, method: str, path: str, *, params: dict | None = None,
-                 json_body: dict | None = None, dataset: str | None = None) -> dict:
+                 dataset: str | None = None) -> dict:
         params = params or {}
         cache_file = None
         if self.cache_dir and method == "GET":
@@ -207,7 +225,7 @@ class Client:
         for attempt in range(self.max_retries + 1):
             try:
                 log.debug("%s %s params=%s (attempt %d)", method, path, params, attempt)
-                r = self._http.request(method, path, params=params, json=json_body)
+                r = self._http.request(method, path, params=params)
                 self._track_rate_limit(r)
                 if r.status_code in _RETRY_STATUS and attempt < self.max_retries:
                     ra = r.headers.get("retry-after")
@@ -239,7 +257,6 @@ class Client:
             try:
                 self.rate_limit_limit = int(h["x-ratelimit-limit"])
                 self.rate_limit_remaining = int(h["x-ratelimit-remaining"])
-                self.tier = h.get("x-ratelimit-tier", self.tier)
                 used_pct = 100 * (1 - self.rate_limit_remaining / max(1, self.rate_limit_limit))
                 if used_pct >= self.warn_rate_limit_pct:
                     log.warning("rate limit %.0f%% used (%d/%d remaining this window)",
@@ -249,99 +266,93 @@ class Client:
 
     # public API
     def catalog(self) -> list[dict[str, Any]]:
-        """Full dataset catalog (coverage, tier, category)."""
-        return self._request("GET", "/v1/data").get("datasets", [])
+        """Public dataset catalog, including coverage, category and attribution."""
+        return self._request("GET", "/v1/datasets").get("datasets", [])
 
     def get(self, dataset: str, *, stock_id: str | None = None,
             start: date | str | None = None, end: date | str | None = None,
-            limit: int = 1000, as_df: bool = False):
-        """Fetch rows from `dataset`. Returns list[dict], or a DataFrame if
-        as_df=True. Warns if the result is truncated at `limit` (raise it or use
-        iter_history for full ranges)."""
+            limit: int = 1000, as_df: bool = False, with_meta: bool = False):
+        """Fetch rows, or a DataFrame with attribution in ``attrs``.
+
+        ``with_meta=True`` returns the response dict, with rows or a DataFrame
+        under ``data`` and source statements under ``attribution``.
+        """
         _validate_dataset(dataset)
         if limit > ROW_CAP:
             raise ValidationError(f"limit {limit} exceeds server cap {ROW_CAP}",
                                   dataset=dataset, suggestion="Use iter_history() to stream large ranges.")
         body = self._request("GET", f"/v1/data/{dataset}",
                              params=_params(stock_id, start, end, limit), dataset=dataset)
-        rows = body.get("data", [])
-        if len(rows) == limit and body.get("next_cursor") is None:
+        if len(body.get("data", [])) == limit and body.get("next_cursor") is None:
             log.warning("'%s' returned exactly limit=%d rows — result is likely TRUNCATED. "
                         "Raise limit or use iter_history().", dataset, limit)
-        return _to_df(rows) if as_df else rows
+        return _result(body, as_df, with_meta)
 
-    def _pull_window(self, dataset: str, *, stock_id=None, start=None, end=None) -> list:
-        """Fully drain one (stock_id, start, end) window by following the server's
-        keyset `next_cursor` until it is null. Returns all rows as one list[dict].
-        This is what lets unbounded datasets (e.g. WarrantInfo, ~126k rows) be
-        collected despite the per-request ROW_CAP."""
-        out: list[dict[str, Any]] = []
+    def _pull_window(self, dataset: str, *, stock_id=None, start=None, end=None) -> dict:
+        """Drain keyset pages and deduplicate attribution across every page."""
+        _validate_dataset(dataset)
+        out: dict[str, Any] = {"data": [], "attribution": []}
         cursor: str | None = None
         while True:
             body = self._request("GET", f"/v1/data/{dataset}",
                                  params=_params(stock_id, start, end, ROW_CAP, cursor),
                                  dataset=dataset)
-            out.extend(body.get("data", []))
+            out["data"].extend(body.get("data", []))
+            _merge_attribution(out["attribution"], body.get("attribution", []))
             cursor = body.get("next_cursor")
             if not cursor:
                 return out
 
     def iter_history(self, dataset: str, *, stock_id: str | None = None,
                      since: date | str | None = None, until: date | str | None = None,
-                     as_df: bool = False) -> Iterator:
-        """Stream a full date range in year-sized chunks (auto-paginates around
-        the 10000-row cap). Yields one batch (list[dict] or DataFrame) per chunk.
+                     as_df: bool = False, with_meta: bool = False) -> Iterator:
+        """Yield year-sized batches, draining every cursor page in each year.
 
-        When `since` is None (e.g. reference/realtime datasets with no date axis),
-        skips date chunking and yields a single batch capped at ROW_CAP."""
+        With no ``since``, drain the dataset as one batch. With ``with_meta``,
+        each batch includes the union of its pages' attribution. Metadata and
+        DataFrame modes also yield empty batches to retain source statements.
+        """
         _validate_dataset(dataset)
         if since is None:
-            # No date axis: drain the whole dataset via keyset cursor (handles
-            # datasets larger than ROW_CAP, e.g. WarrantInfo).
-            rows = self._pull_window(dataset, stock_id=stock_id)
-            if rows:
-                yield _to_df(rows) if as_df else rows
+            body = self._pull_window(dataset, stock_id=stock_id)
+            if body["data"] or with_meta or as_df:
+                yield _result(body, as_df, with_meta)
             return
         s = _as_date(since)
         u = _as_date(until) if until else date.today()
         for cs, ce in _month_chunks(s, u):
-            rows = self._pull_window(dataset, stock_id=stock_id, start=cs, end=ce)
-            if rows:
-                yield _to_df(rows) if as_df else rows
+            body = self._pull_window(dataset, stock_id=stock_id, start=cs, end=ce)
+            if body["data"] or with_meta or as_df:
+                yield _result(body, as_df, with_meta)
 
-    def history(self, dataset: str, **kw) -> list[dict[str, Any]]:
-        """Convenience: fully materialise iter_history into one list (or DataFrame).
-
-        `since` is optional: omit it for datasets with no date axis (reference/
-        realtime) and it behaves like get(dataset, limit=ROW_CAP)."""
+    def history(self, dataset: str, **kw):
+        """Collect all history; metadata unions sources across years and pages."""
         as_df = kw.pop("as_df", False)
-        out: list[dict[str, Any]] = []
-        for batch in self.iter_history(dataset, **kw):
-            out.extend(batch)
-        return _to_df(out) if as_df else out
+        with_meta = kw.pop("with_meta", False)
+        out: dict[str, Any] = {"data": [], "attribution": []}
+        for batch in self.iter_history(dataset, with_meta=True, **kw):
+            out["data"].extend(batch["data"])
+            _merge_attribution(out["attribution"], batch["attribution"])
+        return _result(out, as_df, with_meta)
 
     def bulk_pull(self, datasets: list[str], *, start: date | str | None = None,
                   end: date | str | None = None, stock_id: str | None = None,
-                  as_df: bool = False) -> dict[str, Any]:
-        """Fetch several datasets for the same window; rate-limit-aware (pauses
-        if the window is nearly exhausted). Returns {dataset: rows|DataFrame}."""
+                  as_df: bool = False, with_meta: bool = False) -> dict[str, Any]:
+        """Return {dataset: rows|DataFrame}, draining every page.
+
+        With metadata, return ``{"data": mapping, "attribution": sources}``,
+        where sources is the union across all datasets and pages.
+        """
         out: dict[str, Any] = {}
+        attribution: list[dict[str, Any]] = []
         for d in datasets:
             if self.rate_limit_remaining is not None and self.rate_limit_remaining < 5:
                 log.warning("rate limit nearly exhausted — pausing 5s")
                 time.sleep(5)
-            rows = self._pull_window(d, stock_id=stock_id, start=start, end=end)
-            out[d] = _to_df(rows) if as_df else rows
-        return out
-
-    def ask(self, question: str, *, as_df: bool = False):
-        """Natural-language → SQL query (Plus tier only)."""
-        try:
-            body = self._request("POST", "/v1/ask", json_body={"question": question})
-        except TierError as e:
-            raise TierError("ask() requires the Plus tier", status=403,
-                            suggestion="Upgrade to Plus, or use get() with explicit params.") from e
-        return _to_df(body.get("data", [])) if as_df else body
+            body = self._pull_window(d, stock_id=stock_id, start=start, end=end)
+            out[d] = _result(body, as_df, False)
+            _merge_attribution(attribution, body["attribution"])
+        return {"data": out, "attribution": attribution} if with_meta else out
 
 
 # ───────────────────────── async client ─────────────────────────
@@ -365,7 +376,6 @@ class AsyncClient:
         self.warn_rate_limit_pct = warn_rate_limit_pct
         self.rate_limit_limit: int | None = None
         self.rate_limit_remaining: int | None = None
-        self.tier: str | None = None
         hdrs = {"Authorization": f"Bearer {api_key}", "User-Agent": f"clarifindata-py/{__version__}"}
         try:
             self._http = httpx.AsyncClient(base_url=self.base_url, timeout=timeout, http2=True, headers=hdrs)
@@ -382,18 +392,19 @@ class AsyncClient:
         await self._http.aclose()
 
     def __repr__(self) -> str:
-        return f"AsyncClient(base_url={self.base_url!r}, key={_mask(self.api_key)}, tier={self.tier})"
+        return (f"AsyncClient(base_url={self.base_url!r}, key={_mask(self.api_key)}, "
+                f"rate_limit_remaining={self.rate_limit_remaining})")
 
     def _track(self, r: httpx.Response) -> None:
         Client._track_rate_limit(self, r)  # reuse the same logic
 
-    async def _request(self, method: str, path: str, *, params=None, json_body=None, dataset=None) -> dict:
+    async def _request(self, method: str, path: str, *, params=None, dataset=None) -> dict:
         import asyncio
         params = params or {}
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                r = await self._http.request(method, path, params=params, json=json_body)
+                r = await self._http.request(method, path, params=params)
                 self._track(r)
                 if r.status_code in _RETRY_STATUS and attempt < self.max_retries:
                     ra = r.headers.get("retry-after")
@@ -411,79 +422,81 @@ class AsyncClient:
         raise ClarifindataError("request failed", dataset=dataset) from last
 
     async def catalog(self) -> list[dict[str, Any]]:
-        return (await self._request("GET", "/v1/data")).get("datasets", [])
+        """Public dataset catalog, including attribution."""
+        return (await self._request("GET", "/v1/datasets")).get("datasets", [])
 
     async def get(self, dataset: str, *, stock_id=None, start=None, end=None,
-                  limit: int = 1000, as_df: bool = False):
+                  limit: int = 1000, as_df: bool = False, with_meta: bool = False):
+        """Async mirror of Client.get, including metadata and DataFrame attrs."""
         _validate_dataset(dataset)
         if limit > ROW_CAP:
             raise ValidationError(f"limit {limit} exceeds {ROW_CAP}", dataset=dataset)
         body = await self._request("GET", f"/v1/data/{dataset}",
                                    params=_params(stock_id, start, end, limit), dataset=dataset)
-        rows = body.get("data", [])
-        if len(rows) == limit and body.get("next_cursor") is None:
+        if len(body.get("data", [])) == limit and body.get("next_cursor") is None:
             log.warning("'%s' returned exactly limit=%d — likely truncated.", dataset, limit)
-        return _to_df(rows) if as_df else rows
+        return _result(body, as_df, with_meta)
 
-    async def _pull_window(self, dataset: str, *, stock_id=None, start=None, end=None) -> list:
-        """Async mirror of Client._pull_window — drains one window by following
-        `next_cursor` until null."""
-        out: list[dict[str, Any]] = []
+    async def _pull_window(self, dataset: str, *, stock_id=None, start=None, end=None) -> dict:
+        """Drain keyset pages and union their attribution."""
+        _validate_dataset(dataset)
+        out: dict[str, Any] = {"data": [], "attribution": []}
         cursor: str | None = None
         while True:
             body = await self._request("GET", f"/v1/data/{dataset}",
                                        params=_params(stock_id, start, end, ROW_CAP, cursor),
                                        dataset=dataset)
-            out.extend(body.get("data", []))
+            out["data"].extend(body.get("data", []))
+            _merge_attribution(out["attribution"], body.get("attribution", []))
             cursor = body.get("next_cursor")
             if not cursor:
                 return out
 
     async def iter_history(self, dataset: str, *, stock_id=None,
                            since: date | str | None = None, until: date | str | None = None,
-                           as_df: bool = False) -> list:
-        """Async mirror of Client.iter_history. Returns the list of per-chunk
-        batches (each a list[dict] or DataFrame); iterate with a plain `for`.
+                           as_df: bool = False, with_meta: bool = False) -> list:
+        """Return a list of batches, as before; this is not an async iterator.
 
-        When `since` is None, returns a single batch capped at ROW_CAP."""
+        Each metadata batch unions sources across its pages. Empty batches are
+        retained in metadata and DataFrame modes.
+        """
         _validate_dataset(dataset)
         batches: list = []
         if since is None:
-            rows = await self._pull_window(dataset, stock_id=stock_id)
-            if rows:
-                batches.append(_to_df(rows) if as_df else rows)
+            body = await self._pull_window(dataset, stock_id=stock_id)
+            if body["data"] or with_meta or as_df:
+                batches.append(_result(body, as_df, with_meta))
             return batches
         s = _as_date(since)
         u = _as_date(until) if until else date.today()
         for cs, ce in _month_chunks(s, u):
-            rows = await self._pull_window(dataset, stock_id=stock_id, start=cs, end=ce)
-            if rows:
-                batches.append(_to_df(rows) if as_df else rows)
+            body = await self._pull_window(dataset, stock_id=stock_id, start=cs, end=ce)
+            if body["data"] or with_meta or as_df:
+                batches.append(_result(body, as_df, with_meta))
         return batches
 
-    async def history(self, dataset: str, **kw) -> list[dict[str, Any]]:
-        """Convenience: fully materialise iter_history into one list (or DataFrame).
-
-        `since` is optional: omit it for datasets with no date axis."""
+    async def history(self, dataset: str, **kw):
+        """Collect all history, preserving attribution across years and pages."""
         as_df = kw.pop("as_df", False)
-        out: list[dict[str, Any]] = []
-        for batch in await self.iter_history(dataset, **kw):
-            out.extend(batch)
-        return _to_df(out) if as_df else out
+        with_meta = kw.pop("with_meta", False)
+        out: dict[str, Any] = {"data": [], "attribution": []}
+        for batch in await self.iter_history(dataset, with_meta=True, **kw):
+            out["data"].extend(batch["data"])
+            _merge_attribution(out["attribution"], batch["attribution"])
+        return _result(out, as_df, with_meta)
 
     async def bulk_pull(self, datasets: list[str], *, start: date | str | None = None,
                         end: date | str | None = None, stock_id: str | None = None,
-                        as_df: bool = False) -> dict[str, Any]:
-        """Fetch several datasets for the same window concurrently.
-        Returns {dataset: rows|DataFrame}."""
+                        as_df: bool = False, with_meta: bool = False) -> dict[str, Any]:
+        """Fetch concurrently; metadata unions sources across datasets and pages."""
         import asyncio
-        rows_per = await asyncio.gather(*[
+        bodies = await asyncio.gather(*[
             self._pull_window(d, stock_id=stock_id, start=start, end=end)
             for d in datasets
         ])
-        return {d: (_to_df(rows) if as_df else rows)
-                for d, rows in zip(datasets, rows_per)}
-
-    async def ask(self, question: str, *, as_df: bool = False):
-        body = await self._request("POST", "/v1/ask", json_body={"question": question})
-        return _to_df(body.get("data", [])) if as_df else body
+        out: dict[str, Any] = {}
+        attribution: list[dict[str, Any]] = []
+        for d, body in zip(datasets, bodies):
+            out[d] = _result(body, as_df, False)
+            _merge_attribution(attribution, body["attribution"])
+        return {"data": out, "attribution": attribution} if with_meta else out
